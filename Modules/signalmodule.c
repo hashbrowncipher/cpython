@@ -1550,6 +1550,17 @@ finisignal(void)
     Py_CLEAR(IgnoreHandler);
 }
 
+int
+PyErr_HasSignals(void) {
+    if (!_Py_atomic_load(&is_tripped))
+        return 0;
+
+    if (PyThread_get_thread_ident() != main_thread)
+        return 0;
+
+    return 1;
+}
+
 
 /* Declared in pyerrors.h */
 int
@@ -1558,10 +1569,7 @@ PyErr_CheckSignals(void)
     int i;
     PyObject *f;
 
-    if (!_Py_atomic_load(&is_tripped))
-        return 0;
-
-    if (PyThread_get_thread_ident() != main_thread)
+    if (!PyErr_HasSignals())
         return 0;
 
     /*
