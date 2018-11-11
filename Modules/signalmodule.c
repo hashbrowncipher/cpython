@@ -1617,6 +1617,11 @@ finisignal(void)
     Py_CLEAR(IgnoreHandler);
 }
 
+int
+PyErr_HasSignals(void) {
+    return _Py_atomic_load(&is_tripped);
+}
+
 
 /* Declared in pyerrors.h */
 int
@@ -1638,7 +1643,7 @@ _PyErr_CheckSignals(void)
     int i;
     PyObject *f;
 
-    if (!_Py_atomic_load(&is_tripped))
+    if (!PyErr_HasSignals())
         return 0;
 
     /*
