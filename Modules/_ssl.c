@@ -2441,9 +2441,10 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, int len, int group_right_1,
     PyObject *dest = NULL;
     char *mem;
     int count;
+    int got = 0;
     int sockstate;
     _PySSLError err;
-    int nonblocking;
+    int nonblocking = 0;
     PySocketSockObject *sock = GET_SOCKET(self);
     _PyTime_t timeout, deadline = 0;
     int has_timeout;
@@ -2502,10 +2503,23 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, int len, int group_right_1,
 
     do {
         PySSL_BEGIN_ALLOW_THREADS
-        count = SSL_read(self->ssl, mem, len);
-        err = _PySSL_errno(count <= 0, self->ssl, count);
+        do {
+            count = SSL_read(self->ssl, mem + got, len);
+
+            if(count <= 0 || PyErr_HasSignals()) {
+                err = _PySSL_errno(got == 0, self->ssl, count);
+                break;
+            }
+
+            got += count;
+            len -= count;
+        } while(nonblocking && len > 0);
         PySSL_END_ALLOW_THREADS
         self->err = err;
+
+        if(got > 0) {
+            break;
+        }
 
         if (PyErr_CheckSignals())
             goto error;
@@ -2520,7 +2534,7 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, int len, int group_right_1,
         } else if (err.ssl == SSL_ERROR_ZERO_RETURN &&
                    SSL_get_shutdown(self->ssl) == SSL_RECEIVED_SHUTDOWN)
         {
-            count = 0;
+            got = 0;
             goto done;
         }
         else
@@ -2536,8 +2550,8 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, int len, int group_right_1,
     } while (err.ssl == SSL_ERROR_WANT_READ ||
              err.ssl == SSL_ERROR_WANT_WRITE);
 
-    if (count <= 0) {
-        PySSL_SetError(self, count, __FILE__, __LINE__);
+    if (got <= 0) {
+        PySSL_SetError(self, got, __FILE__, __LINE__);
         goto error;
     }
     if (self->exc_type != NULL)
@@ -2546,11 +2560,11 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, int len, int group_right_1,
 done:
     Py_XDECREF(sock);
     if (!group_right_1) {
-        _PyBytes_Resize(&dest, count);
+        _PyBytes_Resize(&dest, got);
         return dest;
     }
     else {
-        return PyLong_FromLong(count);
+        return PyLong_FromLong(got);
     }
 
 error:
