@@ -952,6 +952,15 @@ newPySSLSocket(PySSLContext *sslctx, PySocketSockObject *sock,
     SSL_set_app_data(self->ssl, self);
     if (sock) {
         SSL_set_fd(self->ssl, Py_SAFE_DOWNCAST(sock->sock_fd, SOCKET_T, int));
+        BIO * rbio = SSL_get_rbio(self->ssl);
+        BIO * bbio = BIO_new(BIO_f_buffer());
+        BIO_set_read_buffer_size(bbio, 8 * 1024 * 1024);
+        BIO_push(bbio, rbio);
+
+        BIO_up_ref(rbio);
+        BIO_up_ref(bbio);
+        SSL_set_bio(self->ssl, bbio, SSL_get_wbio(self->ssl));
+
     } else {
         /* BIOs are reference counted and SSL_set_bio borrows our reference.
          * To prevent a double free in memory_bio_dealloc() we need to take an
