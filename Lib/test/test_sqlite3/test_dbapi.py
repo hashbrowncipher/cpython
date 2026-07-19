@@ -21,6 +21,7 @@
 # 3. This notice may not be removed or altered from any source distribution.
 
 import contextlib
+import functools
 import os
 import sqlite3 as sqlite
 import subprocess
@@ -32,8 +33,7 @@ import urllib.parse
 import warnings
 
 from test.support import (
-    SHORT_TIMEOUT, check_disallow_instantiation, requires_subprocess,
-    is_apple, is_emscripten, is_wasi
+    SHORT_TIMEOUT, check_disallow_instantiation, requires_subprocess
 )
 from test.support import gc_collect
 from test.support import threading_helper, import_helper
@@ -551,17 +551,9 @@ class ConnectionTests(unittest.TestCase):
                 cx.execute("insert into u values(0)")
 
     def test_connect_positional_arguments(self):
-        regex = (
-            r"Passing more than 1 positional argument to sqlite3.connect\(\)"
-            " is deprecated. Parameters 'timeout', 'detect_types', "
-            "'isolation_level', 'check_same_thread', 'factory', "
-            "'cached_statements' and 'uri' will become keyword-only "
-            "parameters in Python 3.15."
-        )
-        with self.assertWarnsRegex(DeprecationWarning, regex) as cm:
-            cx = sqlite.connect(":memory:", 1.0)
-            cx.close()
-        self.assertEqual(cm.filename, __file__)
+        with self.assertRaisesRegex(TypeError,
+                r'connect\(\) takes at most 1 positional arguments'):
+            sqlite.connect(":memory:", 1.0)
 
     def test_connection_resource_warning(self):
         with self.assertWarns(ResourceWarning):
@@ -640,6 +632,14 @@ class SerializeTests(unittest.TestCase):
 class OpenTests(unittest.TestCase):
     _sql = "create table test(id integer)"
 
+    def test_open_with_bytes_path(self):
+        path = os.fsencode(TESTFN)
+        self.addCleanup(unlink, path)
+        self.assertFalse(os.path.exists(path))
+        with contextlib.closing(sqlite.connect(path)) as cx:
+            self.assertTrue(os.path.exists(path))
+            cx.execute(self._sql)
+
     def test_open_with_path_like_object(self):
         """ Checks that we can successfully connect to a database using an object that
             is PathLike, i.e. has __fspath__(). """
@@ -650,14 +650,21 @@ class OpenTests(unittest.TestCase):
             self.assertTrue(os.path.exists(path))
             cx.execute(self._sql)
 
-    @unittest.skipIf(sys.platform == "win32", "skipped on Windows")
-    @unittest.skipIf(is_apple, "skipped on Apple platforms")
-    @unittest.skipIf(is_emscripten or is_wasi, "not supported on Emscripten/WASI")
-    @unittest.skipUnless(TESTFN_UNDECODABLE, "only works if there are undecodable paths")
-    def test_open_with_undecodable_path(self):
+    def get_undecodable_path(self):
         path = TESTFN_UNDECODABLE
+        if not path:
+            self.skipTest("only works if there are undecodable paths")
+        try:
+            open(path, 'wb').close()
+        except OSError:
+            self.skipTest(f"can't create file with undecodable path {path!r}")
+        unlink(path)
+        return path
+
+    @unittest.skipIf(sys.platform == "win32", "skipped on Windows")
+    def test_open_with_undecodable_path(self):
+        path = self.get_undecodable_path()
         self.addCleanup(unlink, path)
-        self.assertFalse(os.path.exists(path))
         with contextlib.closing(sqlite.connect(path)) as cx:
             self.assertTrue(os.path.exists(path))
             cx.execute(self._sql)
@@ -697,14 +704,10 @@ class OpenTests(unittest.TestCase):
                 cx.execute(self._sql)
 
     @unittest.skipIf(sys.platform == "win32", "skipped on Windows")
-    @unittest.skipIf(is_apple, "skipped on Apple platforms")
-    @unittest.skipIf(is_emscripten or is_wasi, "not supported on Emscripten/WASI")
-    @unittest.skipUnless(TESTFN_UNDECODABLE, "only works if there are undecodable paths")
     def test_open_undecodable_uri(self):
-        path = TESTFN_UNDECODABLE
+        path = self.get_undecodable_path()
         self.addCleanup(unlink, path)
         uri = "file:" + urllib.parse.quote(path)
-        self.assertFalse(os.path.exists(path))
         with contextlib.closing(sqlite.connect(uri, uri=True)) as cx:
             self.assertTrue(os.path.exists(path))
             cx.execute(self._sql)
@@ -725,25 +728,44 @@ class OpenTests(unittest.TestCase):
         with contextlib.closing(sqlite.connect(database=":memory:")) as cx:
             self.assertEqual(type(cx), sqlite.Connection)
 
-    @unittest.skipIf(sys.platform == "darwin", "skipped on macOS")
     def test_wal_preservation(self):
         with tempfile.TemporaryDirectory() as dirname:
             path = os.path.join(dirname, "db.sqlite")
+
+            # Set flag to 1, check that WAL file is not deleted on close:
             with contextlib.closing(sqlite.connect(path)) as cx:
                 cx.file_control(sqlite.SQLITE_FCNTL_PERSIST_WAL, 1)
+                # Check that it was set successfully:
+                rc = cx.file_control(sqlite.SQLITE_FCNTL_PERSIST_WAL, -1)
+                assert rc == 1, f"cx.file_control(SQLITE_FCNTL_PERSIST_WAL) failed to set flag"
+
                 cu = cx.cursor()
-                cu.execute("PRAGMA journal_mode = WAL")
+                result = cu.execute("PRAGMA journal_mode = WAL").fetchall()
+                assert result == [('wal',)], f"journal_mode could not be set to WAL, is {result}"
                 cu.execute("CREATE TABLE foo (id int)")
                 cu.execute("INSERT INTO foo (id) VALUES (1)")
                 self.assertTrue(os.path.exists(path + "-wal"))
             self.assertTrue(os.path.exists(path + "-wal"))
 
+            # Set flag to 0, check that WAL file is deleted on close:
             with contextlib.closing(sqlite.connect(path)) as cx:
+                # Check that we can read the default value when we didn't set it explicitly:
+                rc = cx.file_control(sqlite.SQLITE_FCNTL_PERSIST_WAL, -1)
+
+                # The default value should be 0, but on MacOS when compiling with the SDK (not a
+                # custom build of SQLite) it defaults to 0, perhaps customised by Apple?
+                default_value = (1 if sys.platform == "darwin" else 0)
+                assert rc == default_value, f"SQLITE_FCNTL_PERSIST_WAL should be {default_value} " \
+                    "by default, not {rc}"
+
+                # Set it to 0 explicitly so that this test passes on Darwin too:
+                rc = cx.file_control(sqlite.SQLITE_FCNTL_PERSIST_WAL, 0)
+                assert rc == 0, f"cx.file_control(SQLITE_FCNTL_PERSIST_WAL) failed to set flag"
+
                 cu = cx.cursor()
                 self.assertTrue(os.path.exists(path + "-wal"))
                 cu.execute("INSERT INTO foo (id) VALUES (2)")
             self.assertFalse(os.path.exists(path + "-wal"))
-
 
     def test_file_control_raises(self):
         with memory_database() as cx:
@@ -1084,7 +1106,7 @@ class CursorTests(unittest.TestCase):
         # now set to 2
         self.cu.arraysize = 2
 
-        # now make the query return 3 rows
+        # now make the query return 2 rows from a table of 3 rows
         self.cu.execute("delete from test")
         self.cu.execute("insert into test(name) values ('A')")
         self.cu.execute("insert into test(name) values ('B')")
@@ -1094,12 +1116,49 @@ class CursorTests(unittest.TestCase):
 
         self.assertEqual(len(res), 2)
 
+    def test_invalid_array_size(self):
+        UINT32_MAX = (1 << 32) - 1
+        setter = functools.partial(setattr, self.cu, 'arraysize')
+
+        self.assertRaises(TypeError, setter, 1.0)
+        self.assertRaises(ValueError, setter, -3)
+        self.assertRaises(OverflowError, setter, UINT32_MAX + 1)
+
     def test_fetchmany(self):
+        # no active SQL statement
+        res = self.cu.fetchmany()
+        self.assertEqual(res, [])
+        res = self.cu.fetchmany(1000)
+        self.assertEqual(res, [])
+
+        # test default parameter
+        self.cu.execute("select name from test")
+        res = self.cu.fetchmany()
+        self.assertEqual(len(res), 1)
+
+        # test when the number of requested rows exceeds the actual count
         self.cu.execute("select name from test")
         res = self.cu.fetchmany(100)
         self.assertEqual(len(res), 1)
         res = self.cu.fetchmany(100)
         self.assertEqual(res, [])
+
+        # test when size = 0
+        self.cu.execute("select name from test")
+        res = self.cu.fetchmany(0)
+        self.assertEqual(res, [])
+        res = self.cu.fetchmany(100)
+        self.assertEqual(len(res), 1)
+        res = self.cu.fetchmany(100)
+        self.assertEqual(res, [])
+
+    def test_invalid_fetchmany(self):
+        UINT32_MAX = (1 << 32) - 1
+        fetchmany = self.cu.fetchmany
+
+        self.assertRaises(TypeError, fetchmany, 1.0)
+        self.assertRaises(ValueError, fetchmany, -3)
+        self.assertRaises(OverflowError, fetchmany, UINT32_MAX + 1)
 
     def test_fetchmany_kw_arg(self):
         """Checks if fetchmany works with keyword arguments"""
@@ -1365,6 +1424,11 @@ class BlobTests(unittest.TestCase):
     def test_blob_get_empty_slice(self):
         self.assertEqual(self.blob[5:5], b"")
 
+    def test_blob_get_empty_slice_oob_indices(self):
+        self.cx.execute("insert into test(b) values (?)", (b"abc",))
+        with self.cx.blobopen("test", "b", 2) as blob:
+            self.assertEqual(blob[5:-5], b"")
+
     def test_blob_get_slice_negative_index(self):
         self.assertEqual(self.blob[5:-5], self.data[5:-5])
 
@@ -1379,6 +1443,18 @@ class BlobTests(unittest.TestCase):
 
     def test_blob_set_empty_slice(self):
         self.blob[0:0] = b""
+        self.assertEqual(self.blob[:], self.data)
+
+    def test_blob_set_empty_slice_wrong_type(self):
+        with self.assertRaises(TypeError):
+            self.blob[5:5] = None
+
+    def test_blob_set_empty_slice_wrong_size(self):
+        with self.assertRaisesRegex(IndexError, "wrong size"):
+            self.blob[5:5] = b"123"
+
+    def test_blob_set_empty_slice_correct(self):
+        self.blob[5:5] = b""
         self.assertEqual(self.blob[:], self.data)
 
     def test_blob_set_slice_with_skip(self):
